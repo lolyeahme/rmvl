@@ -51,6 +51,9 @@ constexpr double D_y = 50.0;
 constexpr double D_z = 50.0;
 constexpr double D_theta = 5.0;
 
+constexpr double SINGULARITY_THRESHOLD = 1e-6; //!< Jacobian 奇异性检测阈值
+constexpr double ADMITTANCE_GAIN = 100.0;       //!< 导纳速度到关节位置偏移的缩放增益
+
 // ======================== 全局状态 ========================
 static std::atomic_bool running{true};
 static void onSignal(int) { running = false; }
@@ -69,7 +72,7 @@ static void jacobianInverse(const double q[4], const double dx[4], double dq[4])
     double det = L1 * L2 * s2;
 
     // 奇异位形检测
-    if (std::abs(det) < 1e-6)
+    if (std::abs(det) < SINGULARITY_THRESHOLD)
     {
         dq[0] = dq[1] = dq[2] = dq[3] = 0.0;
         return;
@@ -105,7 +108,7 @@ int main()
     latest_joint.position = {0.0, M_PI / 4, 0.0, 0.0};
     latest_joint.velocity = {0.0, 0.0, 0.0, 0.0};
     std::mutex joint_mtx;
-    bool joint_received = false;
+    std::atomic_bool joint_received{false};
 
     // 最新外力（由回调更新）
     msg::Wrench latest_wrench;
@@ -115,7 +118,7 @@ int main()
     auto joint_sub = node.createSubscriber<msg::JointState>("/scara/joint_states", [&](const msg::JointState &msg) {
         std::lock_guard lk(joint_mtx);
         latest_joint = msg;
-        joint_received = true;
+        joint_received.store(true, std::memory_order_release);
     });
 
     auto wrench_sub = node.createSubscriber<msg::Wrench>("/scara/wrench", [&](const msg::Wrench &msg) {
@@ -145,19 +148,19 @@ int main()
         next_time += std::chrono::milliseconds(PERIOD_MS);
 
         // ---- 1. 获取当前状态 ----
+        if (!joint_received.load(std::memory_order_acquire))
+        {
+            ++seq;
+            std::this_thread::sleep_until(next_time);
+            continue;
+        }
+
         double cur_q[4];
         double F_ext[4]; // [Fx, Fy, Fz, Tz]
         {
             std::lock_guard lk(joint_mtx);
-            if (latest_joint.position.size() == 4)
-                for (int i = 0; i < 4; ++i)
-                    cur_q[i] = latest_joint.position[i];
-            else
-            {
-                ++seq;
-                std::this_thread::sleep_until(next_time);
-                continue;
-            }
+            for (int i = 0; i < 4; ++i)
+                cur_q[i] = latest_joint.position[i];
         }
         {
             std::lock_guard lk(wrench_mtx);
@@ -187,7 +190,7 @@ int main()
         // 累积关节偏移量
         double cmd_q[4];
         for (int i = 0; i < 4; ++i)
-            cmd_q[i] = base_position[i] + dq[i] * dt * 100.0; // 缩放增益
+            cmd_q[i] = base_position[i] + dq[i] * dt * ADMITTANCE_GAIN;
 
         // 关节限位保护
         constexpr double q_max[4] = {M_PI, M_PI * 0.9, 0.2, M_PI};
